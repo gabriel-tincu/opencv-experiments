@@ -6,9 +6,11 @@ import traceback
 import glob
 import cv2
 from os.path import basename, join
+from multiprocessing import Pool, cpu_count
 import logging
 import re
-
+import subprocess
+from functools import partial
 logging.basicConfig(level=logging.DEBUG)
 
 def load_annots(path):
@@ -113,22 +115,38 @@ def merge_vec_files(vec_directory, output_vec_file):
 
 
 def grab_potential_price_crops(annotation_folder, image_folder, out_folder):
-    price_re = re.compile('\d*\.\d+') # relly basic stuff
+    price_re = re.compile('.*\d*\.\d+$') # really basic stuff
     annotations = os.listdir(annotation_folder)
     for f in annotations:
-        with open(f) as af:
+        with open(join(annotation_folder, f)) as af:
             image_file_name = join(image_folder, basename(f)[:-5]) # just drop the .json
+            base_name = basename(image_file_name)
             data = json.load(af)
             bboxes = data['bboxes'][1:] # drop the first one
             for i, b in enumerate(bboxes):
-                if price_re.search(b['description']) is not None:
+                if price_re.match(b['description']) is not None and os.path.isfile(image_file_name):
                     image_file = cv2.imread(image_file_name, cv2.IMREAD_GRAYSCALE)
-                    x1, y1 = tuple(b['top_left'])
-                    x2, y2 = tuple(b['bottom_right'])
+                    x1, y1 = b['top_left']['x'], b['top_left']['y']
+                    x2, y2 = b['bottom_right']['x'], b['bottom_right']['y']
                     # todo -> make sure you end up with a good format for training (making the vec file)
                     crop = image_file[y1: y2, x1: x2]
-                    cv2.imwrite(join(out_folder, '{}_{}'.format(i, image_file_name)), crop)
+                    name = join(out_folder, '{}_{}'.format(i, base_name))
+                    print('writing {}'.format(name))
+                    cv2.imwrite(name, crop)
 
+
+def create_training_vector(in_file, neg_file, out_folder):
+    vec_name = join(out_folder, basename(in_file)) + '.vec'
+    subprocess.call(['opencv_createsamples', '-img', in_file, '-vec',  vec_name,
+                     '-bg', neg_file, '-w', '75', '-h', '15', '-maxxangle', '1.4', '-maxyangle', '1.4',
+                     '-maxzangle', '0.7', '-num', '50'])
+    print('Wrote vector for {} in {}'.format(in_file, vec_name))
+
+
+def create_all_vectors(in_folder, neg_file, out_folder):
+    files = [join(in_folder, x) for x in os.listdir(in_folder)]
+    pool = Pool(cpu_count())
+    pool.map(partial(create_training_vector, neg_file=neg_file, out_folder=out_folder), files)
 
 def tag_receipt_files(in_folder, out_folder):
     files = [os.path.join(in_folder, x) for x in os.listdir(in_folder) if 'crop' not in x and x.endswith('jpg')]
@@ -146,5 +164,31 @@ def tag_receipt_files(in_folder, out_folder):
         logging.info('Done tagging {}'.format(f))
         cv2.imwrite(join(out_folder, basename(f)), data)
 
+
+def evaluate_untagged(large_folder, small_folder, model_file, out_folder):
+    model = cv2.CascadeClassifier(model_file)
+    files = set(os.listdir(large_folder)) - set(os.listdir(small_folder))
+    if len(files) == 0:
+        raise Exception('No extra files in {}'.format(large_folder))
+    for f in files:
+        image = cv2.imread(join(large_folder, f), cv2.IMREAD_GRAYSCALE)
+        boxes = model.detectMultiScale(image)
+        if boxes is None or len(boxes) == 0:
+            print('Unable to match any boxes on {}'.format(f))
+            continue
+        print('Found {} boxes'.format(len(boxes)))
+        for x, y , w, h in boxes:
+            cv2.rectangle(image, (x, y), (x+w, y+h), (0,0,0))
+            cv2.imwrite(join(out_folder, f), image)
+
+
 if __name__ == '__main__':
-    tag_receipt_files('/home/gabi/workspace/eloquentix/image-corpus/images', '/tmp/nou_annotated')
+    create_all_vectors(out_folder='/home/gabi/workspace/opencv-haar-classifier-training/samples',
+                       neg_file='/home/gabi/workspace/opencv-haar-classifier-training/negatives.txt',
+                       in_folder='/home/gabi/workspace/opencv-haar-classifier-training/positive_images/')
+    merge_vec_files(vec_directory='/home/gabi/workspace/opencv-haar-classifier-training/samples',
+                    output_vec_file='/home/gabi/workspace/opencv-haar-classifier-training/total_vector.vec')
+    # evaluate_untagged(large_folder='/home/gabi/workspace/eloquentix/image-corpus/images',
+    #                   small_folder='/home/gabi/workspace/eloquentix/image-corpus/proposals/google',
+    #                   model_file='/home/gabi/workspace/opencv-haar-classifier-training/model/cascade.xml',
+    #                   out_folder='/tmp/total_tags')
