@@ -10,6 +10,7 @@ from multiprocessing import Pool, cpu_count
 import logging
 import re
 import subprocess
+import numpy as np
 from functools import partial
 logging.basicConfig(level=logging.DEBUG)
 
@@ -81,6 +82,7 @@ def merge_vec_files(vec_directory, output_vec_file):
 
     # Get the total number of images
     total_num_images = 0
+    num_files = len(files)
     for f in files:
         try:
             with open(f, 'rb') as vecfile:
@@ -97,6 +99,7 @@ def merge_vec_files(vec_directory, output_vec_file):
         except IOError as e:
             logging.error('An IO error occured while processing the file: {0}'.format(f))
             exception_response(e)
+        print('Processed {} / {} files'.format(total_num_images, num_files))
 
     # Iterate through the .vec files, writing their data (not the header) to the output file
     # '<iihh' means 'little endian, int, int, short, short'
@@ -112,6 +115,9 @@ def merge_vec_files(vec_directory, output_vec_file):
                     outputfile.write(data)
     except Exception as e:
         exception_response(e)
+    import shutil
+    print('Merge successful, deleting')
+    shutil.rmtree(vec_directory)
 
 
 def grab_potential_price_crops(annotation_folder, image_folder, out_folder):
@@ -138,15 +144,21 @@ def grab_potential_price_crops(annotation_folder, image_folder, out_folder):
 def create_training_vector(in_file, neg_file, out_folder):
     vec_name = join(out_folder, basename(in_file)) + '.vec'
     subprocess.call(['opencv_createsamples', '-img', in_file, '-vec',  vec_name,
-                     '-bg', neg_file, '-w', '75', '-h', '15', '-maxxangle', '1.4', '-maxyangle', '1.4',
-                     '-maxzangle', '0.7', '-num', '50'])
+                     '-bg', neg_file, '-w', '72', '-h', '24', '-maxxangle', '1.4', '-maxyangle', '1.4',
+                     '-maxzangle', '0.7', '-num', '500'])
     print('Wrote vector for {} in {}'.format(in_file, vec_name))
 
 
 def create_all_vectors(in_folder, neg_file, out_folder):
+    import shutil
+    if os.path.isdir(out_folder):
+        print('{} already present, removing and recreating'.format(out_folder))
+        shutil.rmtree(out_folder)
+        os.makedirs(out_folder)
     files = [join(in_folder, x) for x in os.listdir(in_folder)]
     pool = Pool(cpu_count())
     pool.map(partial(create_training_vector, neg_file=neg_file, out_folder=out_folder), files)
+
 
 def tag_receipt_files(in_folder, out_folder):
     files = [os.path.join(in_folder, x) for x in os.listdir(in_folder) if 'crop' not in x and x.endswith('jpg')]
@@ -154,7 +166,7 @@ def tag_receipt_files(in_folder, out_folder):
     logging.info('Loaded model')
     for f in files:
         data = cv2.imread(f)
-        boxes = model.detectMultiScale(data, scaleFactor=1.3, minSize=(50, 50))
+        boxes = model.detectMultiScale(data, scaleFactor=1.05, minSize=(5, 15))
         logging.info('Found {} boxes for {}'.format(boxes, f))
         if boxes is None or len(boxes) == 0:
             logging.warning('file {} empty :('.format(f))
@@ -172,22 +184,54 @@ def evaluate_untagged(large_folder, small_folder, model_file, out_folder):
         raise Exception('No extra files in {}'.format(large_folder))
     for f in files:
         image = cv2.imread(join(large_folder, f), cv2.IMREAD_GRAYSCALE)
-        boxes = model.detectMultiScale(image)
+        boxes = model.detectMultiScale(image, scaleFactor=1.05, minSize=(5, 10))
         if boxes is None or len(boxes) == 0:
             print('Unable to match any boxes on {}'.format(f))
             continue
         print('Found {} boxes'.format(len(boxes)))
-        for x, y , w, h in boxes:
+        for x, y, w, h in boxes:
             cv2.rectangle(image, (x, y), (x+w, y+h), (0,0,0))
             cv2.imwrite(join(out_folder, f), image)
 
 
+def non_max_supression_slow(boxes, overlap_thr):
+    if len(boxes) == 0:
+        return []
+    pick = []
+    x1, y1, x2, y2 = tuple(boxes.T)
+    area = (x2-x1+1) * (y2-y1+1)
+    idxs = np.argsort(y2)
+    while len(idxs) > 0:
+        last = len(idxs) - 1
+        i = idxs[last]
+        pick.append(i)
+        suppress = [last]
+        for pos in range(last):
+            j = idxs[pos]
+            xx1 = max(x1[i], x1[j])
+            xx2 = min(x2[i], x2[j])
+            yy1 = max(y1[i], y1[j])
+            yy2 = min(y2[i], y2[j])
+            w = max(0, xx2-xx1)
+            h = max(0, yy2-yy1)
+            overlap = float(w * h) / area[j]
+            if overlap > overlap_thr:
+                suppress.append(pos)
+        idxs = np.delete(idxs, suppress)
+    return boxes[pick]
+
+
+def create_vector_file(output_vector_file, neg_file, in_folder, vector_directory):
+    create_all_vectors(in_folder=in_folder,
+                       neg_file=neg_file, out_folder=vector_directory)
+    merge_vec_files(vec_directory=vector_directory,
+                    output_vec_file=output_vector_file)
+
 if __name__ == '__main__':
-    create_all_vectors(out_folder='/home/gabi/workspace/opencv-haar-classifier-training/samples',
+    create_vector_file(in_folder='/home/gabi/workspace/opencv-haar-classifier-training/positive_images/',
                        neg_file='/home/gabi/workspace/opencv-haar-classifier-training/negatives.txt',
-                       in_folder='/home/gabi/workspace/opencv-haar-classifier-training/positive_images/')
-    merge_vec_files(vec_directory='/home/gabi/workspace/opencv-haar-classifier-training/samples',
-                    output_vec_file='/home/gabi/workspace/opencv-haar-classifier-training/total_vector.vec')
+                       output_vector_file='/home/gabi/workspace/opencv-haar-classifier-training/total_vector.vec',
+                       vector_directory='/home/gabi/workspace/opencv-haar-classifier-training/samples')
     # evaluate_untagged(large_folder='/home/gabi/workspace/eloquentix/image-corpus/images',
     #                   small_folder='/home/gabi/workspace/eloquentix/image-corpus/proposals/google',
     #                   model_file='/home/gabi/workspace/opencv-haar-classifier-training/model/cascade.xml',
