@@ -1,3 +1,4 @@
+import pickle
 import json
 import os
 import struct
@@ -12,6 +13,9 @@ import re
 import subprocess
 import numpy as np
 from functools import partial
+from sklearn.svm import LinearSVC
+from skimage.feature import hog
+from math import ceil
 logging.basicConfig(level=logging.DEBUG)
 
 def load_annots(path):
@@ -195,6 +199,7 @@ def evaluate_untagged(large_folder, small_folder, model_file, out_folder):
 
 
 def non_max_supression_slow(boxes, overlap_thr):
+    boxes = np.array(boxes)
     if len(boxes) == 0:
         return []
     pick = []
@@ -221,17 +226,251 @@ def non_max_supression_slow(boxes, overlap_thr):
     return boxes[pick]
 
 
+def split_image(image, crop_w, crop_h):
+    h_splits = int(image.shape[0]/crop_h)
+    w_splits = int(image.shape[1]/crop_w)
+    crops = []
+    for i in range(h_splits):
+        for j in range(w_splits):
+            crops.append(image[i*crop_h:(i+1)*crop_h, j*crop_w:(j+1)*crop_w])
+    return crops
+
+
+def get_image_crops(in_path, out_folder, crop_w, crop_h):
+    i = cv2.imread(in_path)
+    crops = split_image(i, crop_w, crop_h)
+    for i, c in enumerate(crops):
+        name = join(out_folder, '{}_{}'.format(i, basename(in_path)))
+        cv2.imwrite(name, c)
+    print('Wrote all crops for {}'.format(in_path))
+
+
 def create_vector_file(output_vector_file, neg_file, in_folder, vector_directory):
     create_all_vectors(in_folder=in_folder,
                        neg_file=neg_file, out_folder=vector_directory)
     merge_vec_files(vec_directory=vector_directory,
                     output_vec_file=output_vector_file)
 
+
+def write_all_crops(in_folder, out_folder, crop_w, crop_h, file_limit):
+    pool = Pool(cpu_count())
+    files = [join(in_folder, i) for i in os.listdir(in_folder) if i.endswith('jpg')]
+    np.random.shuffle(files)
+    pool.map(partial(get_image_crops, out_folder=out_folder, crop_w=crop_w, crop_h=crop_h), files[:file_limit])
+
+
+def train_svm(train_data, response_data, svm):
+    svm.fit(train_data, response_data)
+    return svm
+
+
+def load_file_and_resize(in_path, w, h):
+    data = cv2.imread(in_path, cv2.IMREAD_GRAYSCALE)
+    if data is None:
+        raise Exception('Error reading {}'.format(in_path))
+    if data.shape[:2] != (h, w):
+        data = cv2.resize(data, (w, h))
+    return data
+
+
+def load_training_data(positive_folder, negative_folder, width, height, save_path='train.pck'):
+    if os.path.isfile(save_path):
+        print('Training data already present on disk')
+        return pickle.load(open(save_path, 'rb'))
+    print('Preparing training data')
+    positive_files = [join(positive_folder, x) for x in os.listdir(positive_folder) if x.endswith('jpg')]
+    negative_files = [join(negative_folder, x) for x in os.listdir(negative_folder) if x.endswith('jpg')]
+    pool = Pool(cpu_count())
+    pos_data = list(zip(pool.map(partial(load_file_and_resize, w=width, h=height), positive_files), np.ones((len(positive_files), 1))))
+    neg_data = list(zip(pool.map(partial(load_file_and_resize, w=width, h=height), negative_files), np.zeros((len(negative_files), 1))))
+    all_data = [x for x in pos_data + neg_data if x[0] is not None]
+    np.random.shuffle(all_data)
+    all_x = [x[0] for x in all_data]
+    all_y = [x[1] for x in all_data]
+    pickle.dump((all_x, all_y), open(save_path, 'wb'))
+    print('Training data loaded and saved on disk')
+    return all_x, all_y
+
+
+def prepare_svm(positive_folder, negative_folder, w, h, svm_save_path='svm.pck'):
+    if os.path.isfile(svm_save_path):
+        return pickle.load(open(svm_save_path, 'rb'))
+    svm = create_svm()
+    all_x, all_y = load_training_data(positive_folder=positive_folder,
+                                      negative_folder=negative_folder,
+                                      width=w,
+                                      height=h)
+    all_x = np.array([hog(x, pixels_per_cell=(h/4, h/4), cells_per_block=(4, 4)).flatten() for x in all_x]).astype(np.float32)
+    all_y = np.array(all_y).astype(np.int32).ravel()
+    print('Training SVM on {} samples'.format(len(all_y)))
+    if not os.path.isfile('svm.pck'):
+        svm = train_svm(all_x, all_y, svm)
+    pickle.dump(svm, open(svm_save_path, 'wb'))
+    print('SVM saved on disk')
+    return svm
+
+
+def create_svm():
+    svm = LinearSVC(C=3)
+    return svm
+
+
+def sliding_window(image, win_size, win_stride):
+    image_h, image_w = image.shape
+    slide_h, slide_w = win_size
+    stride_h, stride_w = win_stride
+    if image_h < slide_h and image_w < slide_w:
+        yield (0, 0), image.shape
+    else:
+        h_limit = int(ceil((image_h-slide_h)/stride_h))
+        w_limit = int(ceil((image_w-slide_w)/stride_w))
+        for i in range(h_limit):
+            for j in range(w_limit):
+                yield (i*stride_h, j*stride_w) ,(i*stride_h+slide_h, j*stride_w+slide_w)
+
+
+def image_pyramid_up(image, scale_factor, max_w, max_h):
+    # we do not need to return the original
+    while True:
+        new_w = int(image.shape[1] * scale_factor)
+        new_h = int(image.shape[0] * scale_factor)
+        image = cv2.resize(image, (new_h, new_w))
+        yield image
+        if new_h > max_h or new_w > max_w:
+            break
+
+
+def image_pyramid_down(image, scale_factor, min_w, min_h):
+    # we do not need to return the original
+    while True:
+        new_w = int(image.shape[1] / scale_factor)
+        new_h = int(image.shape[0] / scale_factor)
+        image = cv2.resize(image, (new_h, new_w))
+        yield image
+        if new_h < min_h or new_w < min_w:
+            break
+
+
+def detect_boxes(image, svm, win_size, win_stride):
+    positives = []
+    win_h, win_w = win_size
+    for (y1, x1), (y2, x2) in sliding_window(image, win_size, win_stride):
+        crop = image[y1:y2, x1:x2]
+        descriptor = hog(crop, pixels_per_cell=(win_h/4, win_h/4), cells_per_block=(4, 4)).flatten()
+        result = svm.predict(descriptor.reshape(1, len(descriptor)))
+        if result[0] == 1.:
+            positives.append(((y1, x1), (y2, x2)))
+    return positives
+
+
+def detect_multi_scale(image, svm, scale, win_size, win_stride, max_size=None, min_size=None):
+    if max_size is None:
+        max_h, max_w = image.shape[0] * 2, image.shape[1] * 2
+    else:
+        max_h, max_w = max_size
+    if min_size is None:
+        min_h, min_w = int(image.shape[0]/2), int(image.shape[1]/2)
+    else:
+        min_h, min_w = min_size
+
+    # first the normal image
+    print('Normal boxes')
+    results = detect_boxes(image, svm, win_size, win_stride)
+
+    # TODO if we ditch the generator pattern and just man up and return a list from up/down scaling, we can then
+    # TODO use multiprocessing to evaluate these in parallel.. maybe even merge the scale/evaluate steps into one
+
+    # then down scaled
+    print('Down boxes')
+    for i in image_pyramid_down(image, scale, min_h, min_w):
+        down_results = detect_boxes(i, svm, win_size, win_stride)
+        if len(down_results) > 0:
+            up_scale = image.shape[0] / i.shape[0]
+            down_results = [((y1*up_scale, x1*up_scale), (y2*up_scale, x2*up_scale)) for ((y1, x1), (y2, x2)) in down_results]
+            results.extend(down_results)
+
+    # then up scaled
+    print('Up boxes')
+    for i in image_pyramid_up(image, scale, max_h, max_w):
+        up_results = detect_boxes(i, svm, win_size, win_stride)
+        if len(up_results) > 0:
+            down_scale = image.shape[0] / i.shape[0]
+            up_results = [((y1*down_scale, x1*down_scale), (y2*down_scale, x2*down_scale)) for ((y1, x1), (y2, x2)) in up_results]
+            results.extend(up_results)
+
+    return results
+
+def evaluate_and_tag(in_path, out_folder, svm, win_size, win_stride, scale):
+    image = cv2.imread(in_path, cv2.IMREAD_GRAYSCALE)
+    results = detect_multi_scale(image=image,
+                                 svm=svm,
+                                 scale=scale,
+                                 win_size=win_size,
+                                 win_stride=win_stride)
+    if len(results) > 0:
+        print('Found {} results for file {}'.format(len(results), in_path))
+        new_boxes = [(x1, y1, x2, y2) for ((y1, x1), (y2, x2)) in results]
+        new_boxes = non_max_supression_slow(new_boxes, 0.5)
+        for row in new_boxes:
+            x1, y1, x2, y2 = tuple(row)
+            cv2.rectangle(image, (x1, y1), (x2, y2), (0,0,0))
+        cv2.imwrite(join(out_folder, basename(in_path)), image)
+
+
+def evaluate_folder(positive_folder, negative_folder, w, h, image_folder, out_folder, scale=1.05, stride=(3, 3)):
+    svm = prepare_svm(positive_folder=positive_folder, negative_folder=negative_folder, w=w, h=h)
+    pool = Pool(cpu_count())
+    files = [join(image_folder, x) for x in os.listdir(image_folder) if x.endswith('jpg')]
+    pool.map(partial(evaluate_and_tag, out_folder=out_folder, svm=svm, win_size=(h,w), win_stride=stride, scale=scale), files)
+
+
+def evaluate_full():
+    positive_folder = '/home/gabi/workspace/opencv-haar-classifier-training/positive_images/'
+    negative_folder = '/home/gabi/workspace/opencv-haar-classifier-training/negative_crops'
+    image_folder = '/home/gabi/workspace/eloquentix/image-corpus/images'
+    out_folder = '/tmp/svm_tagged'
+    w = 60
+    h = 20
+    evaluate_folder(positive_folder=positive_folder,
+                    negative_folder=negative_folder,
+                    w=w,
+                    h=h,
+                    image_folder=image_folder,
+                    out_folder=out_folder)
+
 if __name__ == '__main__':
-    create_vector_file(in_folder='/home/gabi/workspace/opencv-haar-classifier-training/positive_images/',
-                       neg_file='/home/gabi/workspace/opencv-haar-classifier-training/negatives.txt',
-                       output_vector_file='/home/gabi/workspace/opencv-haar-classifier-training/total_vector.vec',
-                       vector_directory='/home/gabi/workspace/opencv-haar-classifier-training/samples')
+    evaluate_full()
+    # write_all_crops(out_folder='/home/gabi/workspace/opencv-haar-classifier-training/negative_text_crops',
+    #                 in_folder='/home/gabi/workspace/opencv-haar-classifier-training/all_negatives/',
+    #                 crop_h=20, crop_w=60, file_limit=1000)
+    # image = cv2.imread('/home/gabi/workspace/eloquentix/image-corpus/images/5728acfba310caacd16191b5_f59b982d-76f4-458f-b4b4-3d0f62b93058.jpg', cv2.IMREAD_GRAYSCALE)
+    # positive_folder = '/home/gabi/workspace/opencv-haar-classifier-training/positive_images/'
+    # negative_folder = '/home/gabi/workspace/opencv-haar-classifier-training/negative_crops'
+    # image_folder = '/home/gabi/workspace/eloquentix/image-corpus/images'
+    # out_folder = '/tmp/svm_tagged'
+    # w = 60
+    # h = 20
+    # svm = prepare_svm(negative_folder=negative_folder,
+    #                   positive_folder=positive_folder,
+    #                   w=w,
+    #                   h=h)
+    # boxes = detect_boxes(image, svm, win_size=(h, w), win_stride=(3,3))
+    #
+    # new_boxes = [(x1, y1, x2, y2) for ((y1, x1), (y2, x2)) in boxes]
+    # supressed = non_max_supression_slow(new_boxes, 0.5)
+    # print('{} boxes before suppression, {} after'.format(len(new_boxes), len(supressed)))
+    # print('TAGGED!')
+    # for row in supressed:
+    #     x1, y1, x2, y2 = tuple(row)
+    #     cv2.rectangle(image, (x1, y1), (x2, y2), (0,0,0))
+    # cv2.imwrite('/tmp/tagged.jpg', image)
+    # write_all_crops(out_folder='/home/gabi/workspace/opencv-haar-classifier-training/negative_crops',
+    #                 in_folder='/home/gabi/workspace/opencv-haar-classifier-training/all_negatives/',
+    #                 crop_h=20, crop_w=60, file_limit=1000)
+    # create_vector_file(in_folder='/home/gabi/workspace/opencv-haar-classifier-training/positive_images/',
+    #                    neg_file='/home/gabi/workspace/opencv-haar-classifier-training/negatives.txt',
+    #                    output_vector_file='/home/gabi/workspace/opencv-haar-classifier-training/total_vector.vec',
+    #                    vector_directory='/home/gabi/workspace/opencv-haar-classifier-training/samples')
     # evaluate_untagged(large_folder='/home/gabi/workspace/eloquentix/image-corpus/images',
     #                   small_folder='/home/gabi/workspace/eloquentix/image-corpus/proposals/google',
     #                   model_file='/home/gabi/workspace/opencv-haar-classifier-training/model/cascade.xml',
