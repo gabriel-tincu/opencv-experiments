@@ -109,7 +109,7 @@ def merge_vec_files(vec_directory, output_vec_file):
                     data = content[12:]
                     outputfile.write(data)
     except Exception as e:
-        exception_response(e)
+        logging.error(e)
     import shutil
     logging.info('Merge successful, deleting')
     shutil.rmtree(vec_directory)
@@ -351,7 +351,7 @@ def image_pyramid_up(image, scale_factor, max_w, max_h):
     while True:
         new_w = int(image.shape[1] * scale_factor)
         new_h = int(image.shape[0] * scale_factor)
-        image = cv2.resize(image, (new_h, new_w))
+        image = cv2.resize(image, (new_w, new_h))
         yield image
         if new_h > max_h or new_w > max_w:
             break
@@ -362,7 +362,7 @@ def image_pyramid_down(image, scale_factor, min_w, min_h):
     while True:
         new_w = int(image.shape[1] / scale_factor)
         new_h = int(image.shape[0] / scale_factor)
-        image = cv2.resize(image, (new_h, new_w))
+        image = cv2.resize(image, (new_w, new_h))
         yield image
         if new_h < min_h or new_w < min_w:
             break
@@ -381,12 +381,13 @@ def detect_boxes(image, svm, win_size, win_stride):
 
 
 def detect_multi_scale(image, svm, scale, win_size, win_stride, max_size=None, min_size=None):
+    # TODO -> fix max and min sizes to a some more intuitive value
     if max_size is None:
-        max_h, max_w = image.shape[0] * 2, image.shape[1] * 2
+        max_h, max_w = int(image.shape[0] * 1/2), int(image.shape[1] * 1/2)
     else:
         max_h, max_w = max_size
     if min_size is None:
-        min_h, min_w = int(image.shape[0]/2), int(image.shape[1]/2)
+        min_h, min_w = int(image.shape[0]/1.5), int(image.shape[1]/1.5)
     else:
         min_h, min_w = min_size
 
@@ -409,7 +410,8 @@ def detect_multi_scale(image, svm, scale, win_size, win_stride, max_size=None, m
         up_results = detect_boxes(i, svm, win_size, win_stride)
         if len(up_results) > 0:
             down_scale = image.shape[0] / i.shape[0]
-            up_results = [((y1*down_scale, x1*down_scale), (y2*down_scale, x2*down_scale)) for ((y1, x1), (y2, x2)) in up_results]
+            up_results = [((y1*down_scale, x1*down_scale), (y2*down_scale, x2*down_scale)) for
+                          ((y1, x1), (y2, x2)) in up_results]
             results.extend(up_results)
 
     return results
@@ -431,14 +433,20 @@ def evaluate_and_copy_negatives(in_path, svm, win_size, win_stride, scale, truth
             t = [b for b in new_boxes if intersection_over_union(b, tb) > 0.5]
             for tr in t:
                 true_results.add(tr)
-        false_results = [x for x in new_boxes if x not in true_results]
-        logging.info('out of {} boxes, {} are classified as negatives and {} as positives'.format(len(new_boxes), len(false_results), len(true_results)))
+        false_results = [x for x in new_boxes if x not in true_results and box_area(*x) > 0]
+        logging.info('out of {} boxes, {} are classified as negatives and {} as positives'.
+                     format(len(new_boxes), len(false_results), len(true_results)))
         for i, b in enumerate(false_results):
             x1, y1, x2, y2 = tuple(b)
-            crop = cv2.resize(image[y1:y2, x1:x2], win_size)
+            crop = image[y1:y2, x1:x2]
+            crop = cv2.resize(crop, (win_size[1], win_size[0]))
             fp_name = join(negative_folder, '{}_{}'.format(i, basename(in_path)))
-            logging.info('Writing fp {}'.format(fp_name))
             cv2.imwrite(join(fp_name), crop)
+        logging.info('Wrote {} false positives to {}'.format(len(false_results), negative_folder))
+
+
+def box_area(x1, y1, x2, y2):
+    return abs(x2-x1)*abs(y2-y1)
 
 
 def intersection_over_union(b1, b2):
