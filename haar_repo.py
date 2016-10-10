@@ -16,7 +16,9 @@ from functools import partial
 from sklearn.svm import LinearSVC
 from skimage.feature import hog
 from math import ceil
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.DEBUG,
+                    format='%(asctime)s %(message)s',
+                    datefmt='%m/%d/%Y %I:%M:%S %p')
 
 def load_annots(path):
     return [x for x in json.load(open(path)) if len(x['annotations']) > 0]
@@ -305,7 +307,7 @@ def load_training_data(positive_folder, negative_folder, width, height, save_pat
     all_x = [x[0] for x in all_data]
     all_y = [x[1] for x in all_data]
     pickle.dump((all_x, all_y), open(save_path, 'wb'))
-    logging.info('Training data loaded and savedlogging.info on disk')
+    logging.info('Training data loaded and saved on disk')
     return all_x, all_y
 
 
@@ -441,7 +443,7 @@ def evaluate_and_copy_negatives(in_path, svm, win_size, win_stride, scale, truth
             crop = image[y1:y2, x1:x2]
             try:
                 crop = cv2.resize(crop, (win_size[1], win_size[0]))
-            except Exception as e:
+            except:
                 logging.error('Error resizing from {}'.format(crop.shape))
             fp_name = join(negative_folder, '{}_{}'.format(i, basename(in_path)))
             cv2.imwrite(join(fp_name), crop)
