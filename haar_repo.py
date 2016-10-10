@@ -424,7 +424,7 @@ def detect_multi_scale(image, svm, scale, win_size, win_stride, max_size=None, m
     return results
 
 
-def evaluate_and_copy_negatives(in_path, out_folder, svm, win_size, win_stride, scale, truth_folder, negative_folder):
+def evaluate_and_copy_negatives(in_path, svm, win_size, win_stride, scale, truth_folder, negative_folder):
     truth_boxes = get_price_boxes(in_path, truth_folder)
     image = cv2.imread(in_path, cv2.IMREAD_GRAYSCALE)
     results = detect_multi_scale(image=image,
@@ -442,7 +442,7 @@ def evaluate_and_copy_negatives(in_path, out_folder, svm, win_size, win_stride, 
                 true_results.add(tr)
         false_results = [x for x in new_boxes if x not in true_results]
         logging.info('out of {} boxes, {} are classified as negatives and {} as positives'.format(len(new_boxes), len(false_results), len(true_results)))
-        for b, i in enumerate(false_results):
+        for i, b in enumerate(false_results):
             x1, y1, x2, y2 = tuple(b)
             crop = cv2.resize(image[y1:y2, x1:x2], win_size)
             fp_name = join(negative_folder, '{}_{}'.format(i, basename(in_path)))
@@ -477,7 +477,6 @@ def evaluate_folder(positive_folder,
                     w,
                     h,
                     image_folder,
-                    out_folder,
                     truth_folder,
                     scale=1.05,
                     stride=(3, 3)):
@@ -485,7 +484,6 @@ def evaluate_folder(positive_folder,
     pool = Pool(cpu_count())
     files = [join(image_folder, x) for x in os.listdir(image_folder) if x.endswith('jpg')]
     pool.map(partial(evaluate_and_copy_negatives,
-                     out_folder=out_folder,
                      svm=svm,
                      win_size=(h,w),
                      win_stride=stride,
@@ -499,7 +497,6 @@ def evaluate_full():
     positive_folder = '/home/gabi/workspace/opencv-haar-classifier-training/positive_images/'
     negative_folder = '/home/gabi/workspace/opencv-haar-classifier-training/negative_crops'
     image_folder = '/home/gabi/workspace/eloquentix/image-corpus/images'
-    out_folder = '/tmp/total_tags'
     w = 60
     h = 20
     evaluate_folder(positive_folder=positive_folder,
@@ -507,27 +504,12 @@ def evaluate_full():
                     w=w,
                     h=h,
                     image_folder=image_folder,
-                    out_folder=out_folder,
                     truth_folder=truth_folder)
 
 if __name__ == '__main__':
     evaluate_full()
 
     # write_all_crops(out_folder='/home/gabi/workspace/opencv-haar-classifier-training/negative_text_crops',
-    #                 in_folder='/home/gabi/workspace/opencv-haar-classifier-training/all_negatives/',
-    #                 crop_h=20, crop_w=60, file_limit=1000)
-    # image = cv2.imread('/home/gabi/workspace/eloquentix/image-corpus/images/5728acfba310caacd16191b5_f59b982d-76f4-458f-b4b4-3d0f62b93058.jpg', cv2.IMREAD_GRAYSCALE)
-    # boxes = detect_boxes(image, svm, win_size=(h, w), win_stride=(3,3))
-    #
-    # new_boxes = [(x1, y1, x2, y2) for ((y1, x1), (y2, x2)) in boxes]
-    # supressed = non_max_supression_slow(new_boxes, 0.5)
-    # print('{} boxes before suppression, {} after'.format(len(new_boxes), len(supressed)))
-    # print('TAGGED!')
-    # for row in supressed:
-    #     x1, y1, x2, y2 = tuple(row)
-    #     cv2.rectangle(image, (x1, y1), (x2, y2), (0,0,0))
-    # cv2.imwrite('/tmp/tagged.jpg', image)
-    # write_all_crops(out_folder='/home/gabi/workspace/opencv-haar-classifier-training/negative_crops',
     #                 in_folder='/home/gabi/workspace/opencv-haar-classifier-training/all_negatives/',
     #                 crop_h=20, crop_w=60, file_limit=1000)
     # create_vector_file(in_folder='/home/gabi/workspace/opencv-haar-classifier-training/positive_images/',
@@ -537,4 +519,4 @@ if __name__ == '__main__':
     # evaluate_untagged(in_folder='/home/gabi/workspace/eloquentix/benchmark/images',
     #                   model_file='/home/gabi/workspace/opencv2_python/cascade.xml',
     #                   out_folder='/tmp/total_tags',
-#                   truth_folder='/home/gabi/workspace/eloquentix/benchmark/annotations')
+    #                   truth_folder='/home/gabi/workspace/eloquentix/benchmark/annotations')
