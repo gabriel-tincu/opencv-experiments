@@ -124,6 +124,19 @@ def merge_vec_files(vec_directory, output_vec_file):
     shutil.rmtree(vec_directory)
 
 
+def get_price_boxes(image_file_name, annotation_folder):
+    price_re = re.compile('.*\d*\.\d+$') # really basic stuff
+    annotation_file = join(annotation_folder, basename(image_file_name) + '.json')
+    if not os.path.isfile(annotation_file):
+        logging.warning('File {} does not exist, returning empty list'.format(annotation_file))
+        return []
+    with open(annotation_file) as af:
+        data = json.load(af)['bboxes'][1:]
+        data = [(b['top_left']['x'], b['top_left']['y'], b['bottom_right']['x'], b['bottom_right']['y'])
+                for b in data if price_re.match(b['description'])]
+    return data
+
+
 def grab_potential_price_crops(annotation_folder, image_folder, out_folder):
     price_re = re.compile('.*\d*\.\d+$') # really basic stuff
     annotations = os.listdir(annotation_folder)
@@ -181,21 +194,34 @@ def tag_receipt_files(in_folder, out_folder):
         cv2.imwrite(join(out_folder, basename(f)), data)
 
 
-def evaluate_untagged(large_folder, small_folder, model_file, out_folder):
+def evaluate_untagged(in_folder, model_file, out_folder, truth_folder):
+    files = [f for f in os.listdir(in_folder) if f.endswith('jpg')]
+    pool = Pool(cpu_count())
+    pool.map(partial(evaluate_file_with_model, in_folder=in_folder, model_file=model_file, truth_folder=truth_folder, out_folder=out_folder), files)
+
+
+def evaluate_file_with_model(f, in_folder, out_folder, truth_folder, model_file):
     model = cv2.CascadeClassifier(model_file)
-    files = set(os.listdir(large_folder)) - set(os.listdir(small_folder))
-    if len(files) == 0:
-        raise Exception('No extra files in {}'.format(large_folder))
-    for f in files:
-        image = cv2.imread(join(large_folder, f), cv2.IMREAD_GRAYSCALE)
-        boxes = model.detectMultiScale(image, scaleFactor=1.05, minSize=(5, 10))
-        if boxes is None or len(boxes) == 0:
-            print('Unable to match any boxes on {}'.format(f))
-            continue
-        print('Found {} boxes'.format(len(boxes)))
-        for x, y, w, h in boxes:
-            cv2.rectangle(image, (x, y), (x+w, y+h), (0,0,0))
-            cv2.imwrite(join(out_folder, f), image)
+    image = cv2.imread(join(in_folder, f), cv2.IMREAD_GRAYSCALE)
+    annot_file = join(truth_folder, f.split('.')[0] + '.json')
+    if not os.path.isfile(annot_file):
+        print('Annotation file {} not found'.format(annot_file))
+    truth_boxes = [list(map(int, b['bounds'])) for b in json.load(open(annot_file)) if b['entity_type'] == 'TOTAL']
+    boxes = model.detectMultiScale(image, scaleFactor=1.01, minSize=(3, 9), minNeighbors=3)
+    if boxes is None or len(boxes) == 0:
+        print('Unable to match any boxes on {}'.format(f))
+    print('Found {} boxes'.format(len(boxes)))
+    for tb in truth_boxes:
+        closest_boxes = sorted(boxes, key=lambda b: box_distance(b, tb))[:2]
+        for x, y, w, h in closest_boxes:
+            cv2.rectangle(image, (x, y), (x+w, y+h), (0,0,0), 4)
+        cv2.rectangle(image, (tb[0], tb[1]), (tb[2], tb[3]), (255,0,0), 4)
+    print('Writing {}'.format(join(out_folder, f)))
+    cv2.imwrite(join(out_folder, f), image)
+
+
+def box_distance(b1, b2):
+    return np.sqrt(sum([abs(c1 - c2) ** 2 for c1, c2 in zip(b1, b2)]))
 
 
 def non_max_supression_slow(boxes, overlap_thr):
@@ -374,14 +400,12 @@ def detect_multi_scale(image, svm, scale, win_size, win_stride, max_size=None, m
         min_h, min_w = min_size
 
     # first the normal image
-    print('Normal boxes')
     results = detect_boxes(image, svm, win_size, win_stride)
 
     # TODO if we ditch the generator pattern and just man up and return a list from up/down scaling, we can then
     # TODO use multiprocessing to evaluate these in parallel.. maybe even merge the scale/evaluate steps into one
 
     # then down scaled
-    print('Down boxes')
     for i in image_pyramid_down(image, scale, min_h, min_w):
         down_results = detect_boxes(i, svm, win_size, win_stride)
         if len(down_results) > 0:
@@ -390,7 +414,6 @@ def detect_multi_scale(image, svm, scale, win_size, win_stride, max_size=None, m
             results.extend(down_results)
 
     # then up scaled
-    print('Up boxes')
     for i in image_pyramid_up(image, scale, max_h, max_w):
         up_results = detect_boxes(i, svm, win_size, win_stride)
         if len(up_results) > 0:
@@ -400,7 +423,9 @@ def detect_multi_scale(image, svm, scale, win_size, win_stride, max_size=None, m
 
     return results
 
-def evaluate_and_tag(in_path, out_folder, svm, win_size, win_stride, scale):
+
+def evaluate_and_copy_negatives(in_path, out_folder, svm, win_size, win_stride, scale, truth_folder, negative_folder):
+    truth_boxes = get_price_boxes(in_path, truth_folder)
     image = cv2.imread(in_path, cv2.IMREAD_GRAYSCALE)
     results = detect_multi_scale(image=image,
                                  svm=svm,
@@ -410,25 +435,68 @@ def evaluate_and_tag(in_path, out_folder, svm, win_size, win_stride, scale):
     if len(results) > 0:
         print('Found {} results for file {}'.format(len(results), in_path))
         new_boxes = [(x1, y1, x2, y2) for ((y1, x1), (y2, x2)) in results]
-        new_boxes = non_max_supression_slow(new_boxes, 0.5)
-        for row in new_boxes:
-            x1, y1, x2, y2 = tuple(row)
-            cv2.rectangle(image, (x1, y1), (x2, y2), (0,0,0))
-        cv2.imwrite(join(out_folder, basename(in_path)), image)
+        for tb in truth_boxes:
+            false_results = [b for b in new_boxes if intersection_over_union(b, tb) < 0.5]
+            for b, i in enumerate(false_results):
+                # avoid duplication of data
+                new_boxes.remove(b)
+                x1, y1, x2, y2 = tuple(b)
+                crop = cv2.resize(image[y1:y2, x1:x2], win_size)
+                fp_name = join(negative_folder, '{}_{}'.format(i, basename(in_path)))
+                print('Writing fp {}'.format(fp_name))
+                cv2.imwrite(join(fp_name), crop)
 
 
-def evaluate_folder(positive_folder, negative_folder, w, h, image_folder, out_folder, scale=1.05, stride=(3, 3)):
+def intersection_over_union(b1, b2):
+    """
+        Calculate intersection / union between 2 rectangles
+        Returns a positive value (between 0 and 1) representing
+        the ratio between the 2 areas or 0 if the boxes have no intersecting area
+    """
+    # if they don't intersect
+    if b1[2] < b2[0] or b1[3] < b2[1]:
+        return 0
+    union_p1 = (min(b1[0], b2[0]), min(b1[1], b2[1]))
+    union_p2 = (max(b1[2], b2[2]), max(b1[3], b2[3]))
+
+    intersect_p1 = (max(b1[0], b2[0]), max(b1[1], b2[1]))
+    intersect_p2 = (min(b1[2], b2[2]), min(b1[3], b2[3]))
+
+    union_area = (union_p2[0] - union_p1[0]) * (union_p2[1] - union_p1[1])
+    intersect_area = (intersect_p2[0] - intersect_p1[0]) * (intersect_p2[1] - intersect_p1[1])
+    if union_area <= 0 or intersect_area <= 0:
+        return 0
+    return float(intersect_area) / float(union_area)
+
+
+def evaluate_folder(positive_folder,
+                    negative_folder,
+                    w,
+                    h,
+                    image_folder,
+                    out_folder,
+                    truth_folder,
+                    scale=1.05,
+                    stride=(3, 3)):
     svm = prepare_svm(positive_folder=positive_folder, negative_folder=negative_folder, w=w, h=h)
     pool = Pool(cpu_count())
     files = [join(image_folder, x) for x in os.listdir(image_folder) if x.endswith('jpg')]
-    pool.map(partial(evaluate_and_tag, out_folder=out_folder, svm=svm, win_size=(h,w), win_stride=stride, scale=scale), files)
+    pool.map(partial(evaluate_and_copy_negatives,
+                     out_folder=out_folder,
+                     svm=svm,
+                     win_size=(h,w),
+                     win_stride=stride,
+                     scale=scale,
+                     truth_folder=truth_folder,
+                     negative_folder=negative_folder), files)
 
 
 def evaluate_full():
+    truth_folder = '/home/gabi/workspace/eloquentix/image-corpus/google'
     positive_folder = '/home/gabi/workspace/opencv-haar-classifier-training/positive_images/'
     negative_folder = '/home/gabi/workspace/opencv-haar-classifier-training/negative_crops'
     image_folder = '/home/gabi/workspace/eloquentix/image-corpus/images'
-    out_folder = '/tmp/svm_tagged'
+    out_folder = '/tmp/total_tags'
     w = 60
     h = 20
     evaluate_folder(positive_folder=positive_folder,
@@ -436,24 +504,16 @@ def evaluate_full():
                     w=w,
                     h=h,
                     image_folder=image_folder,
-                    out_folder=out_folder)
+                    out_folder=out_folder,
+                    truth_folder=truth_folder)
 
 if __name__ == '__main__':
     evaluate_full()
+
     # write_all_crops(out_folder='/home/gabi/workspace/opencv-haar-classifier-training/negative_text_crops',
     #                 in_folder='/home/gabi/workspace/opencv-haar-classifier-training/all_negatives/',
     #                 crop_h=20, crop_w=60, file_limit=1000)
     # image = cv2.imread('/home/gabi/workspace/eloquentix/image-corpus/images/5728acfba310caacd16191b5_f59b982d-76f4-458f-b4b4-3d0f62b93058.jpg', cv2.IMREAD_GRAYSCALE)
-    # positive_folder = '/home/gabi/workspace/opencv-haar-classifier-training/positive_images/'
-    # negative_folder = '/home/gabi/workspace/opencv-haar-classifier-training/negative_crops'
-    # image_folder = '/home/gabi/workspace/eloquentix/image-corpus/images'
-    # out_folder = '/tmp/svm_tagged'
-    # w = 60
-    # h = 20
-    # svm = prepare_svm(negative_folder=negative_folder,
-    #                   positive_folder=positive_folder,
-    #                   w=w,
-    #                   h=h)
     # boxes = detect_boxes(image, svm, win_size=(h, w), win_stride=(3,3))
     #
     # new_boxes = [(x1, y1, x2, y2) for ((y1, x1), (y2, x2)) in boxes]
@@ -471,7 +531,7 @@ if __name__ == '__main__':
     #                    neg_file='/home/gabi/workspace/opencv-haar-classifier-training/negatives.txt',
     #                    output_vector_file='/home/gabi/workspace/opencv-haar-classifier-training/total_vector.vec',
     #                    vector_directory='/home/gabi/workspace/opencv-haar-classifier-training/samples')
-    # evaluate_untagged(large_folder='/home/gabi/workspace/eloquentix/image-corpus/images',
-    #                   small_folder='/home/gabi/workspace/eloquentix/image-corpus/proposals/google',
-    #                   model_file='/home/gabi/workspace/opencv-haar-classifier-training/model/cascade.xml',
-    #                   out_folder='/tmp/total_tags')
+    # evaluate_untagged(in_folder='/home/gabi/workspace/eloquentix/benchmark/images',
+    #                   model_file='/home/gabi/workspace/opencv2_python/cascade.xml',
+    #                   out_folder='/tmp/total_tags',
+#                   truth_folder='/home/gabi/workspace/eloquentix/benchmark/annotations')
