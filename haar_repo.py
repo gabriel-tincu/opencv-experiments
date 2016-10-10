@@ -435,21 +435,24 @@ def evaluate_and_copy_negatives(in_path, out_folder, svm, win_size, win_stride, 
     if len(results) > 0:
         print('Found {} results for file {}'.format(len(results), in_path))
         new_boxes = [(x1, y1, x2, y2) for ((y1, x1), (y2, x2)) in results]
+        true_results = set()
         for tb in truth_boxes:
-            false_results = [b for b in new_boxes if intersection_over_union(b, tb) < 0.5]
-            for b, i in enumerate(false_results):
-                # avoid duplication of data
-                new_boxes.remove(b)
-                x1, y1, x2, y2 = tuple(b)
-                crop = cv2.resize(image[y1:y2, x1:x2], win_size)
-                fp_name = join(negative_folder, '{}_{}'.format(i, basename(in_path)))
-                print('Writing fp {}'.format(fp_name))
-                cv2.imwrite(join(fp_name), crop)
+            t = [b for b in new_boxes if intersection_over_union(b, tb) > 0.5]
+            for tr in t:
+                true_results.add(tr)
+        false_results = [x for x in new_boxes if x not in true_results]
+        logging.info('out of {} boxes, {} are classified as negatives and {} as positives'.format(len(new_boxes), len(false_results), len(true_results)))
+        for b, i in enumerate(false_results):
+            x1, y1, x2, y2 = tuple(b)
+            crop = cv2.resize(image[y1:y2, x1:x2], win_size)
+            fp_name = join(negative_folder, '{}_{}'.format(i, basename(in_path)))
+            print('Writing fp {}'.format(fp_name))
+            cv2.imwrite(join(fp_name), crop)
 
 
 def intersection_over_union(b1, b2):
     """
-        Calculate intersection / union between 2 rectangles
+        Calculate intersection / union ratio between 2 rectangles
         Returns a positive value (between 0 and 1) representing
         the ratio between the 2 areas or 0 if the boxes have no intersecting area
     """
