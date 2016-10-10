@@ -34,13 +34,6 @@ def write_annotations(in_path, out_path):
         of.writelines(annot_lines)
 
 
-def exception_response(e):
-    exc_type, exc_value, exc_traceback = sys.exc_info()
-    lines = traceback.format_exception(exc_type, exc_value, exc_traceback)
-    for line in lines:
-        print(line)
-
-
 def merge_vec_files(vec_directory, output_vec_file):
     """
     Iterates throught the .vec files in a directory and combines them.
@@ -81,8 +74,7 @@ def merge_vec_files(vec_directory, output_vec_file):
             val = struct.unpack('<iihh', content[:12])
             prev_image_size = val[1]
     except IOError as e:
-        print('An IO error occured while processing the file: {0}'.format(files[0]))
-        exception_response(e)
+        logging.error('An IO error occured while processing the file: {0}'.format(files[0]))
 
     # Get the total number of images
     total_num_images = 0
@@ -102,8 +94,7 @@ def merge_vec_files(vec_directory, output_vec_file):
                 total_num_images += num_images
         except IOError as e:
             logging.error('An IO error occured while processing the file: {0}'.format(f))
-            exception_response(e)
-        print('Processed {} / {} files'.format(total_num_images, num_files))
+        logging.info('Processed {} / {} files'.format(total_num_images, num_files))
 
     # Iterate through the .vec files, writing their data (not the header) to the output file
     # '<iihh' means 'little endian, int, int, short, short'
@@ -120,7 +111,7 @@ def merge_vec_files(vec_directory, output_vec_file):
     except Exception as e:
         exception_response(e)
     import shutil
-    print('Merge successful, deleting')
+    logging.info('Merge successful, deleting')
     shutil.rmtree(vec_directory)
 
 
@@ -154,7 +145,7 @@ def grab_potential_price_crops(annotation_folder, image_folder, out_folder):
                     # todo -> make sure you end up with a good format for training (making the vec file)
                     crop = image_file[y1: y2, x1: x2]
                     name = join(out_folder, '{}_{}'.format(i, base_name))
-                    print('writing {}'.format(name))
+                    logging.info('writing {}'.format(name))
                     cv2.imwrite(name, crop)
 
 
@@ -163,13 +154,13 @@ def create_training_vector(in_file, neg_file, out_folder):
     subprocess.call(['opencv_createsamples', '-img', in_file, '-vec',  vec_name,
                      '-bg', neg_file, '-w', '72', '-h', '24', '-maxxangle', '1.4', '-maxyangle', '1.4',
                      '-maxzangle', '0.7', '-num', '500'])
-    print('Wrote vector for {} in {}'.format(in_file, vec_name))
+    logging.info('Wrote vector for {} in {}'.format(in_file, vec_name))
 
 
 def create_all_vectors(in_folder, neg_file, out_folder):
     import shutil
     if os.path.isdir(out_folder):
-        print('{} already present, removing and recreating'.format(out_folder))
+        logging.info('{} already present, removing and recreating'.format(out_folder))
         shutil.rmtree(out_folder)
         os.makedirs(out_folder)
     files = [join(in_folder, x) for x in os.listdir(in_folder)]
@@ -205,18 +196,18 @@ def evaluate_file_with_model(f, in_folder, out_folder, truth_folder, model_file)
     image = cv2.imread(join(in_folder, f), cv2.IMREAD_GRAYSCALE)
     annot_file = join(truth_folder, f.split('.')[0] + '.json')
     if not os.path.isfile(annot_file):
-        print('Annotation file {} not found'.format(annot_file))
+        logging.info('Annotation file {} not found'.format(annot_file))
     truth_boxes = [list(map(int, b['bounds'])) for b in json.load(open(annot_file)) if b['entity_type'] == 'TOTAL']
     boxes = model.detectMultiScale(image, scaleFactor=1.01, minSize=(3, 9), minNeighbors=3)
     if boxes is None or len(boxes) == 0:
-        print('Unable to match any boxes on {}'.format(f))
-    print('Found {} boxes'.format(len(boxes)))
+        logging.warning('Unable to match any boxes on {}'.format(f))
+    logging.info('Found {} boxes'.format(len(boxes)))
     for tb in truth_boxes:
         closest_boxes = sorted(boxes, key=lambda b: box_distance(b, tb))[:2]
         for x, y, w, h in closest_boxes:
             cv2.rectangle(image, (x, y), (x+w, y+h), (0,0,0), 4)
         cv2.rectangle(image, (tb[0], tb[1]), (tb[2], tb[3]), (255,0,0), 4)
-    print('Writing {}'.format(join(out_folder, f)))
+    logging.info('Writing {}'.format(join(out_folder, f)))
     cv2.imwrite(join(out_folder, f), image)
 
 
@@ -268,7 +259,7 @@ def get_image_crops(in_path, out_folder, crop_w, crop_h):
     for i, c in enumerate(crops):
         name = join(out_folder, '{}_{}'.format(i, basename(in_path)))
         cv2.imwrite(name, c)
-    print('Wrote all crops for {}'.format(in_path))
+    logging.info('Wrote all crops for {}'.format(in_path))
 
 
 def create_vector_file(output_vector_file, neg_file, in_folder, vector_directory):
@@ -301,9 +292,9 @@ def load_file_and_resize(in_path, w, h):
 
 def load_training_data(positive_folder, negative_folder, width, height, save_path='train.pck'):
     if os.path.isfile(save_path):
-        print('Training data already present on disk')
+        logging.info('Training data already present on disk')
         return pickle.load(open(save_path, 'rb'))
-    print('Preparing training data')
+    logging.info('Preparing training data')
     positive_files = [join(positive_folder, x) for x in os.listdir(positive_folder) if x.endswith('jpg')]
     negative_files = [join(negative_folder, x) for x in os.listdir(negative_folder) if x.endswith('jpg')]
     pool = Pool(cpu_count())
@@ -314,7 +305,7 @@ def load_training_data(positive_folder, negative_folder, width, height, save_pat
     all_x = [x[0] for x in all_data]
     all_y = [x[1] for x in all_data]
     pickle.dump((all_x, all_y), open(save_path, 'wb'))
-    print('Training data loaded and saved on disk')
+    logging.info('Training data loaded and savedlogging.info on disk')
     return all_x, all_y
 
 
@@ -328,11 +319,11 @@ def prepare_svm(positive_folder, negative_folder, w, h, svm_save_path='svm.pck')
                                       height=h)
     all_x = np.array([hog(x, pixels_per_cell=(h/4, h/4), cells_per_block=(4, 4)).flatten() for x in all_x]).astype(np.float32)
     all_y = np.array(all_y).astype(np.int32).ravel()
-    print('Training SVM on {} samples'.format(len(all_y)))
+    logging.info('Training SVM on {} samples'.format(len(all_y)))
     if not os.path.isfile('svm.pck'):
         svm = train_svm(all_x, all_y, svm)
     pickle.dump(svm, open(svm_save_path, 'wb'))
-    print('SVM saved on disk')
+    logging.info('SVM saved on disk')
     return svm
 
 
@@ -433,7 +424,7 @@ def evaluate_and_copy_negatives(in_path, svm, win_size, win_stride, scale, truth
                                  win_size=win_size,
                                  win_stride=win_stride)
     if len(results) > 0:
-        print('Found {} results for file {}'.format(len(results), in_path))
+        logging.info('Found {} results for file {}'.format(len(results), in_path))
         new_boxes = [(x1, y1, x2, y2) for ((y1, x1), (y2, x2)) in results]
         true_results = set()
         for tb in truth_boxes:
@@ -446,7 +437,7 @@ def evaluate_and_copy_negatives(in_path, svm, win_size, win_stride, scale, truth
             x1, y1, x2, y2 = tuple(b)
             crop = cv2.resize(image[y1:y2, x1:x2], win_size)
             fp_name = join(negative_folder, '{}_{}'.format(i, basename(in_path)))
-            print('Writing fp {}'.format(fp_name))
+            logging.info('Writing fp {}'.format(fp_name))
             cv2.imwrite(join(fp_name), crop)
 
 
