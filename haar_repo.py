@@ -439,7 +439,10 @@ def evaluate_and_copy_negatives(in_path, svm, win_size, win_stride, scale, truth
         for i, b in enumerate(false_results):
             x1, y1, x2, y2 = tuple(b)
             crop = image[y1:y2, x1:x2]
-            crop = cv2.resize(crop, (win_size[1], win_size[0]))
+            try:
+                crop = cv2.resize(crop, (win_size[1], win_size[0]))
+            except Exception as e:
+                logging.error('Error resizing from {}'.format(crop.shape))
             fp_name = join(negative_folder, '{}_{}'.format(i, basename(in_path)))
             cv2.imwrite(join(fp_name), crop)
         logging.info('Wrote {} false positives to {}'.format(len(false_results), negative_folder))
