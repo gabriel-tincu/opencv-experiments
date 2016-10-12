@@ -3,7 +3,6 @@ import json
 import os
 import struct
 import sys
-import traceback
 import glob
 import cv2
 from os.path import basename, join
@@ -14,11 +13,20 @@ import subprocess
 import numpy as np
 from functools import partial
 from sklearn.svm import LinearSVC
-from skimage.feature import hog
 from math import ceil
+from sklearn.feature_extraction.image import extract_patches
+
 logging.basicConfig(level=logging.DEBUG,
                     format='%(asctime)s %(message)s',
                     datefmt='%m/%d/%Y %I:%M:%S %p')
+
+def create_hog():
+    desc = cv2.HOGDescriptor((20, 20), (10, 10), (5, 5), (5, 5), 9)
+    def compute(arr):
+        return desc.compute(arr)
+    return compute
+
+hog = create_hog()
 
 def load_annots(path):
     return [x for x in json.load(open(path)) if len(x['annotations']) > 0]
@@ -288,7 +296,7 @@ def load_file_and_resize(in_path, w, h):
     if data is None:
         raise Exception('Error reading {}'.format(in_path))
     if data.shape[:2] != (h, w):
-        data = cv2.resize(data, (w, h))
+        data = cv2.resize(data, (w, h), interpolation=cv2.INTER_CUBIC)
     return data
 
 
@@ -319,7 +327,7 @@ def prepare_svm(positive_folder, negative_folder, w, h, svm_save_path='svm.pck')
                                       negative_folder=negative_folder,
                                       width=w,
                                       height=h)
-    all_x = np.array([hog(x, pixels_per_cell=(h/4, h/4), cells_per_block=(4, 4)).flatten() for x in all_x]).astype(np.float32)
+    all_x = np.array([hog(x) for x in all_x]).astype(np.float32)
     all_y = np.array(all_y).astype(np.int32).ravel()
     logging.info('Training SVM on {} samples'.format(len(all_y)))
     if not os.path.isfile('svm.pck'):
@@ -332,6 +340,13 @@ def prepare_svm(positive_folder, negative_folder, w, h, svm_save_path='svm.pck')
 def create_svm():
     svm = LinearSVC(C=3)
     return svm
+
+
+def fast_sliding_window(image, win_size, win_stride):
+    slides = extract_patches(image, patch_shape=win_size, extraction_step=win_stride)
+    for i in slides.shape[0]:
+        for j in slides.shape[1]:
+            yield slides[i, j]
 
 
 def sliding_window(image, win_size, win_stride):
@@ -353,7 +368,7 @@ def image_pyramid_up(image, scale_factor, max_w, max_h):
     while True:
         new_w = int(image.shape[1] * scale_factor)
         new_h = int(image.shape[0] * scale_factor)
-        image = cv2.resize(image, (new_w, new_h))
+        image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
         yield image
         if new_h > max_h or new_w > max_w:
             break
@@ -364,7 +379,7 @@ def image_pyramid_down(image, scale_factor, min_w, min_h):
     while True:
         new_w = int(image.shape[1] / scale_factor)
         new_h = int(image.shape[0] / scale_factor)
-        image = cv2.resize(image, (new_w, new_h))
+        image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
         yield image
         if new_h < min_h or new_w < min_w:
             break
@@ -372,10 +387,9 @@ def image_pyramid_down(image, scale_factor, min_w, min_h):
 
 def detect_boxes(image, svm, win_size, win_stride):
     positives = []
-    win_h, win_w = win_size
     for (y1, x1), (y2, x2) in sliding_window(image, win_size, win_stride):
         crop = image[y1:y2, x1:x2]
-        descriptor = hog(crop, pixels_per_cell=(win_h/4, win_h/4), cells_per_block=(4, 4)).flatten()
+        descriptor = hog(crop)
         result = svm.predict(descriptor.reshape(1, len(descriptor)))
         if result[0] == 1.:
             positives.append(((y1, x1), (y2, x2)))
@@ -385,11 +399,11 @@ def detect_boxes(image, svm, win_size, win_stride):
 def detect_multi_scale(image, svm, scale, win_size, win_stride, max_size=None, min_size=None):
     # TODO -> fix max and min sizes to a some more intuitive value
     if max_size is None:
-        max_h, max_w = int(image.shape[0] * 1/2), int(image.shape[1] * 1/2)
+        max_h, max_w = int(image.shape[0] * 2), int(image.shape[1] * 2)
     else:
         max_h, max_w = max_size
     if min_size is None:
-        min_h, min_w = int(image.shape[0]/1.5), int(image.shape[1]/1.5)
+        min_h, min_w = int(image.shape[0]/2), int(image.shape[1]/2)
     else:
         min_h, min_w = min_size
 
@@ -419,7 +433,13 @@ def detect_multi_scale(image, svm, scale, win_size, win_stride, max_size=None, m
     return results
 
 
-def evaluate_and_copy_negatives(in_path, svm, win_size, win_stride, scale, truth_folder, negative_folder):
+def evaluate_and_copy_negatives(in_path,
+                                svm,
+                                win_size,
+                                win_stride,
+                                scale,
+                                truth_folder,
+                                negative_folder):
     truth_boxes = get_price_boxes(in_path, truth_folder)
     image = cv2.imread(in_path, cv2.IMREAD_GRAYSCALE)
     results = detect_multi_scale(image=image,
@@ -442,7 +462,7 @@ def evaluate_and_copy_negatives(in_path, svm, win_size, win_stride, scale, truth
             x1, y1, x2, y2 = tuple(b)
             crop = image[y1:y2, x1:x2]
             try:
-                crop = cv2.resize(crop, (win_size[1], win_size[0]))
+                crop = cv2.resize(crop, (win_size[1], win_size[0]), interpolation=cv2.INTER_CUBIC)
             except:
                 logging.error('Error resizing from {}'.format(crop.shape))
             fp_name = join(negative_folder, '{}_{}'.format(i, basename(in_path)))
@@ -512,7 +532,6 @@ def evaluate_full():
 
 if __name__ == '__main__':
     evaluate_full()
-
     # write_all_crops(out_folder='/home/gabi/workspace/opencv-haar-classifier-training/negative_text_crops',
     #                 in_folder='/home/gabi/workspace/opencv-haar-classifier-training/all_negatives/',
     #                 crop_h=20, crop_w=60, file_limit=1000)
