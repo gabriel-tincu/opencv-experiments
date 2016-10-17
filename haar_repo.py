@@ -4,6 +4,8 @@ import os
 import struct
 import sys
 import glob
+from tesserocr import PyTessBaseAPI, RIL
+import PIL
 import cv2
 from os.path import basename, join
 from multiprocessing import Pool, cpu_count
@@ -12,7 +14,8 @@ import re
 import subprocess
 import numpy as np
 from functools import partial
-from sklearn.svm import LinearSVC
+from sklearn.linear_model import SGDClassifier
+from sklearn.utils.class_weight import compute_class_weight
 from math import ceil
 from sklearn.feature_extraction.image import extract_patches
 
@@ -20,13 +23,15 @@ logging.basicConfig(level=logging.DEBUG,
                     format='%(asctime)s %(message)s',
                     datefmt='%m/%d/%Y %I:%M:%S %p')
 
+
 def create_hog():
-    desc = cv2.HOGDescriptor((20, 20), (10, 10), (5, 5), (5, 5), 9)
+    desc = cv2.HOGDescriptor((8, 8), (4, 4), (2, 2), (2, 2), 9)
     def compute(arr):
         return desc.compute(arr)
     return compute
 
 hog = create_hog()
+
 
 def load_annots(path):
     return [x for x in json.load(open(path)) if len(x['annotations']) > 0]
@@ -125,6 +130,50 @@ def merge_vec_files(vec_directory, output_vec_file):
     shutil.rmtree(vec_directory)
 
 
+def create_symbol_annotation_file(image_file_name, annotation_folder, api):
+    annotation_file = join(annotation_folder, basename(image_file_name) + '.json')
+    if os.path.isfile(annotation_file):
+        return
+    gray_image = cv2.imread(image_file_name, cv2.IMREAD_GRAYSCALE)
+    faulty = ['5714408ea310a43cd79dfb05', '570e54e2a3103f2d963bb2df', '5726b721a310a74ad90b77d0',
+              '570b1759a310ebd5d0ba530d', '5717cb68a3102c7fbf48f4bd', '572bea80a31066a71353945e',
+              '5726afe1a310ebd5d0bad97b', '573a6cb4a3102f2d5d09f8cc', '57165843a31023407b767388',
+              '573a3265a3106ec45f15c059', '572ce0eda310a68cf380f93f', '57082e0ea3102295b4d5b9ea',
+              '5713c683a3100724fc6ab01f', '572fc5dda3102c7fbf49647e', '570ab33ea310e9ec32f94164',
+              '571108e7a3100724fc6aa677', '570ab33ea310e9ec32f94164', '573cace5a310c76c3067d532',
+              '570ab299a3107b84a89a53bb', '57197c47a3100724fc6ad2e8', '5739e74fa310ce1ed1a66b77',
+              '571bf4afa310f2452af5ff1e', '573281fea31010683247ca73']
+    if gray_image is None or get_id(image_file_name) in faulty:
+        logging.error('Image {} could not be read'.format(image_file_name))
+        return
+    thr = cv2.adaptiveThreshold(gray_image, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 9, 4)
+    image = PIL.Image.fromarray(thr)
+    api.SetImage(image)
+    boxes = api.GetComponentImages(RIL.SYMBOL, True)
+    boxes = [x[1] for x in boxes]
+    with open(annotation_file, 'wb') as af:
+        json.dump(boxes, af)
+
+
+def create_symbol_corpus(image_folder, out_folder):
+    with PyTessBaseAPI() as api:
+        for f in os.listdir(image_folder):
+            create_symbol_annotation_file(join(image_folder, f), out_folder, api)
+            logging.info('Wrote tesseract annotations for {}'.format(f))
+
+
+def get_id(path):
+    return basename(path).split('_')[0]
+
+def get_symbol_boxes(image_file_name, annotation_folder):
+    annotation_file = join(annotation_folder, basename(image_file_name) + '.json')
+    if not os.path.exists(annotation_file):
+        return None
+    with open(annotation_file, 'rb') as af:
+        data = json.load(af)
+        return [(d['x'], d['y'], d['x'] + d['w'], d['y'] + d['h']) for d in data]
+
+
 def get_price_boxes(image_file_name, annotation_folder):
     price_re = re.compile('.*\d*\.\d+$') # really basic stuff
     annotation_file = join(annotation_folder, basename(image_file_name) + '.json')
@@ -221,6 +270,27 @@ def evaluate_file_with_model(f, in_folder, out_folder, truth_folder, model_file)
     cv2.imwrite(join(out_folder, f), image)
 
 
+def get_tesseract_symbol_crops(in_path, out_folder):
+    gray_image = cv2.imread(in_path, cv2.IMREAD_GRAYSCALE)
+    if gray_image is None:
+        logging.error('Image {} could not be read'.format(in_path))
+        return
+    thr = cv2.adaptiveThreshold(gray_image, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 9, 4)
+    image = PIL.Image.fromarray(thr)
+    with PyTessBaseAPI() as api:
+        api.SetImage(image)
+        boxes = api.GetComponentImages(RIL.SYMBOL, True)
+    boxes = [x[1] for x in boxes]
+    for i, b in enumerate(boxes):
+        cv2.imwrite(join(out_folder, '{}_{}'.format(i, basename(in_path))), gray_image[b['y']-1:b['y']+b['h']+1,b['x']-1:b['x']+b['w']+1])
+    logging.info('wrote patches for {}'.format(in_path))
+
+
+def create_positive_tesseract_corpus(in_folder, out_folder):
+    pool = Pool(cpu_count())
+    in_files = [join(in_folder, x) for x in os.listdir(in_folder) if x.endswith('jpg')]
+    pool.map(partial(get_tesseract_symbol_crops, out_folder=out_folder), in_files)
+
 def box_distance(b1, b2):
     return np.sqrt(sum([abs(c1 - c2) ** 2 for c1, c2 in zip(b1, b2)]))
 
@@ -264,8 +334,8 @@ def split_image(image, crop_w, crop_h):
 
 
 def get_image_crops(in_path, out_folder, crop_w, crop_h):
-    i = cv2.imread(in_path)
-    crops = split_image(i, crop_w, crop_h)
+    i = cv2.imread(in_path, cv2.IMREAD_GRAYSCALE)
+    crops = fast_sliding_window(i, (crop_h, crop_w), (3,3))
     for i, c in enumerate(crops):
         name = join(out_folder, '{}_{}'.format(i, basename(in_path)))
         cv2.imwrite(name, c)
@@ -283,12 +353,11 @@ def write_all_crops(in_folder, out_folder, crop_w, crop_h, file_limit):
     pool = Pool(cpu_count())
     files = [join(in_folder, i) for i in os.listdir(in_folder) if i.endswith('jpg')]
     np.random.shuffle(files)
-    pool.map(partial(get_image_crops, out_folder=out_folder, crop_w=crop_w, crop_h=crop_h), files[:file_limit])
+    pool.map(partial(get_image_crops, out_folder=out_folder, crop_w=crop_w, crop_h=crop_h), files if not file_limit else files[:file_limit])
 
 
-def train_svm(train_data, response_data, svm):
-    svm.fit(train_data, response_data)
-    return svm
+def train_model(train_data, response_data, model):
+    return model.partial_fit(train_data, response_data)
 
 
 def load_file_and_resize(in_path, w, h):
@@ -319,33 +388,63 @@ def load_training_data(positive_folder, negative_folder, width, height, save_pat
     return all_x, all_y
 
 
-def prepare_svm(positive_folder, negative_folder, w, h, svm_save_path='svm.pck'):
+def batch_training_data(positive_folder, negative_folder, width, height, n_batches):
+    positive_files = [join(positive_folder, x) for x in os.listdir(positive_folder) if x.endswith('jpg')]
+    negative_files = [join(negative_folder, x) for x in os.listdir(negative_folder) if x.endswith('jpg')]
+    np.random.shuffle(positive_files)
+    np.random.shuffle(negative_files)
+    pos_batch_size = int(np.ceil(len(positive_files)/n_batches))
+    neg_batch_size = int(np.ceil(len(negative_files)/n_batches))
+
+    for i in range(n_batches):
+        pos_x = positive_files[pos_batch_size*i:pos_batch_size*(i+1)]
+        neg_x = negative_files[neg_batch_size*i:neg_batch_size*(i+1)]
+        pos_y = [1 for _ in pos_x]
+        neg_y = [0 for _ in neg_x]
+        all_x = list(map(partial(load_file_and_resize, w=width, h=height), pos_x + neg_x))
+        all_y = pos_y+neg_y
+        yield all_x, all_y
+
+
+def get_class_weight(positive_folder, negative_folder):
+    y = [1 for _ in os.listdir(positive_folder)] + [0 for _ in os.listdir(negative_folder)]
+    weights = compute_class_weight('balanced', np.array([1, 0]), y)
+    return {1: weights[0], 0: weights[1]}
+
+
+def prepare_model(positive_folder, negative_folder, w, h, svm_save_path='svm.pck'):
     if os.path.isfile(svm_save_path):
         return pickle.load(open(svm_save_path, 'rb'))
-    svm = create_svm()
-    all_x, all_y = load_training_data(positive_folder=positive_folder,
-                                      negative_folder=negative_folder,
-                                      width=w,
-                                      height=h)
-    all_x = np.array([hog(x) for x in all_x]).astype(np.float32)
-    all_y = np.array(all_y).astype(np.int32).ravel()
-    logging.info('Training SVM on {} samples'.format(len(all_y)))
-    if not os.path.isfile('svm.pck'):
-        svm = train_svm(all_x, all_y, svm)
-    pickle.dump(svm, open(svm_save_path, 'wb'))
-    logging.info('SVM saved on disk')
-    return svm
+    model = create_model()
+    first_pass = True
+    model.class_weight = get_class_weight(positive_folder, negative_folder)
+    for all_x, all_y in batch_training_data(positive_folder=positive_folder,
+                                            negative_folder=negative_folder,
+                                            width=w,
+                                            height=h,
+                                            n_batches=50):
+        all_x = np.array([hog(x).flatten() for x in all_x]).astype(np.float32)
+        all_y = np.array(all_y).astype(np.int32).ravel()
+        logging.info('Training model on {} samples'.format(len(all_y)))
+        if first_pass:
+            model = model.partial_fit(all_x, all_y, classes=[1, 0])
+            first_pass = False
+        else:
+            model = model.partial_fit(all_x, all_y)
+        pickle.dump(model, open(svm_save_path, 'wb'))
+        logging.info('Model saved on disk')
+    return model
 
 
-def create_svm():
-    svm = LinearSVC(C=3)
-    return svm
+def create_model():
+    model = SGDClassifier()
+    return model
 
 
 def fast_sliding_window(image, win_size, win_stride):
     slides = extract_patches(image, patch_shape=win_size, extraction_step=win_stride)
-    for i in slides.shape[0]:
-        for j in slides.shape[1]:
+    for i in range(slides.shape[0]):
+        for j in range(slides.shape[1]):
             yield slides[i, j]
 
 
@@ -440,7 +539,9 @@ def evaluate_and_copy_negatives(in_path,
                                 scale,
                                 truth_folder,
                                 negative_folder):
-    truth_boxes = get_price_boxes(in_path, truth_folder)
+    truth_boxes = get_symbol_boxes(in_path, truth_folder)
+    if truth_boxes is None:
+        logging.error('No annotation file present for {}...skipping analisys'.format(in_path))
     image = cv2.imread(in_path, cv2.IMREAD_GRAYSCALE)
     results = detect_multi_scale(image=image,
                                  svm=svm,
@@ -452,7 +553,7 @@ def evaluate_and_copy_negatives(in_path,
         new_boxes = [(x1, y1, x2, y2) for ((y1, x1), (y2, x2)) in results]
         true_results = set()
         for tb in truth_boxes:
-            t = [b for b in new_boxes if intersection_over_union(b, tb) > 0.5]
+            t = [b for b in new_boxes if intersection_over_union(b, tb) > 0.6]
             for tr in t:
                 true_results.add(tr)
         false_results = [x for x in new_boxes if x not in true_results and box_area(*x) > 0]
@@ -470,8 +571,41 @@ def evaluate_and_copy_negatives(in_path,
         logging.info('Wrote {} false positives to {}'.format(len(false_results), negative_folder))
 
 
+def evaluate_and_write_results(in_path,
+                               svm,
+                               win_size,
+                               win_stride,
+                               scale,
+                               out_folder):
+    image = cv2.imread(in_path, cv2.IMREAD_GRAYSCALE)
+    results = detect_multi_scale(image=image,
+                                 svm=svm,
+                                 scale=scale,
+                                 win_size=win_size,
+                                 win_stride=win_stride)
+    if len(results) == 0:
+        print('No results found for {}'.format(in_path))
+        return
+    logging.info('Found {} results for file {}'.format(len(results), in_path))
+    new_boxes = [(x1, y1, x2, y2) for ((y1, x1), (y2, x2)) in results]
+    for x1, y1, x2, y2 in new_boxes:
+        cv2.rectangle(image, (x1, y1), (x2, y2), 0, 2)
+    cv2.imwrite(join(out_folder, basename(in_path)), image)
+    logging.info('Done evaluating {}'.format(in_path))
+
+
 def box_area(x1, y1, x2, y2):
     return abs(x2-x1)*abs(y2-y1)
+
+
+def write_corners(in_path, out_folder):
+    orig = cv2.imread(in_path)
+    gray = cv2.cvtColor(orig, cv2.COLOR_BGR2GRAY).astype('float32')
+    dst = cv2.cornerHarris(gray, 2, 3, 0.04)
+    # dst = cv2.dilate(dst, None, 3)
+    orig[dst>0.005*dst.max()]=[0,0,255]
+    cv2.imwrite(join(out_folder, basename(in_path)), orig)
+    logging.info('Wrote corners for {}'.format(in_path))
 
 
 def intersection_over_union(b1, b2):
@@ -501,40 +635,80 @@ def evaluate_folder(positive_folder,
                     w,
                     h,
                     image_folder,
-                    truth_folder,
                     scale=1.05,
                     stride=(3, 3)):
-    svm = prepare_svm(positive_folder=positive_folder, negative_folder=negative_folder, w=w, h=h)
+    model = prepare_model(positive_folder=positive_folder, negative_folder=negative_folder, w=w, h=h)
     pool = Pool(cpu_count())
     files = [join(image_folder, x) for x in os.listdir(image_folder) if x.endswith('jpg')]
     pool.map(partial(evaluate_and_copy_negatives,
-                     svm=svm,
+                     svm=model,
                      win_size=(h,w),
                      win_stride=stride,
                      scale=scale,
-                     truth_folder=truth_folder,
+                     truth_folder='/home/gabi/workspace/eloquentix/image-corpus/tesseract',
                      negative_folder=negative_folder), files)
 
+def eval_one():
+    model = prepare_model(None, None, 0, 0)
+    evaluate_and_write_results(in_path='/home/gabi/workspace/eloquentix/image-corpus/images/5728a478a3103667aa3c1a6d_e0367cbd-0864-4e76-bc32-4749de87f8f5.jpg',
+                               svm=model,
+                               win_size=(20, 60),
+                               win_stride=(3, 3),
+                               scale=1.05,
+                               out_folder='/tmp/out')
+
+def write_all_file_corners():
+    image_folder = '/home/gabi/workspace/eloquentix/image-corpus/images'
+    out_folder = '/tmp/out'
+    for f in os.listdir(image_folder):
+        write_corners(join(image_folder, f), out_folder)
 
 def evaluate_full():
-    truth_folder = '/home/gabi/workspace/eloquentix/image-corpus/google'
-    positive_folder = '/home/gabi/workspace/opencv-haar-classifier-training/positive_images/'
-    negative_folder = '/home/gabi/workspace/opencv-haar-classifier-training/negative_crops'
+    truth_folder = '/home/gabi/workspace/eloquentix/image-corpus/tesseract'
+    positive_folder = '/home/gabi/workspace/opencv-haar-classifier-training/positive_symbols/'
+    negative_folder = '/home/gabi/workspace/opencv-haar-classifier-training/negative_symbols'
     image_folder = '/home/gabi/workspace/eloquentix/image-corpus/images'
-    w = 60
-    h = 20
+    w = 8
+    h = 16
     evaluate_folder(positive_folder=positive_folder,
                     negative_folder=negative_folder,
                     w=w,
                     h=h,
-                    image_folder=image_folder,
-                    truth_folder=truth_folder)
+                    image_folder=image_folder)
+
+
+def mask_image(image, mask_size):
+    mask = np.zeros_like(image)
+    for i in range(int(mask.shape[0]/mask_size)):
+        for j in range(int(mask.shape[1]/mask_size)):
+            val = int(np.mean(image[i*mask_size:(i+1)*mask_size, j*mask_size:(j+1)*mask_size]))
+            mask[i*mask_size:(i+1)*mask_size, j*mask_size:(j+1)*mask_size] = val
+    return mask
+
+
+def image_center_and_total_mean_and_median(in_path):
+    radius = 25
+    i = cv2.imread(in_path, cv2.IMREAD_GRAYSCALE)
+    if i is None:
+        return None
+    h, w = i.shape
+    h_center, w_center = int(h/2), int(w/2)
+    y1, x1 = 0 if h_center<radius else h_center-radius, 0 if w_center<radius else w_center-radius
+    y2, x2 = min(h, h_center+radius), min(w, w_center + radius)
+    crop = i[y1:y2,x1:x2]
+    image_mean, image_median = np.mean(i), np.median(i)
+    crop_mean, crop_median = np.mean(crop), np.median(crop)
+    return image_mean, image_median, crop_mean, crop_median
+
 
 if __name__ == '__main__':
+    # write_all_file_corners()
+    # create_symbol_corpus('/home/gabi/workspace/eloquentix/image-corpus/images',
+    #                      '/home/gabi/workspace/eloquentix/image-corpus/tesseract')
     evaluate_full()
-    # write_all_crops(out_folder='/home/gabi/workspace/opencv-haar-classifier-training/negative_text_crops',
-    #                 in_folder='/home/gabi/workspace/opencv-haar-classifier-training/all_negatives/',
-    #                 crop_h=20, crop_w=60, file_limit=1000)
+    # write_all_crops(out_folder='/home/gabi/workspace/opencv-haar-classifier-training/negative_symbols',
+    #                 in_folder='/home/gabi/workspace/opencv-haar-classifier-training/negative_images/',
+    #                 crop_h=16, crop_w=8, file_limit=None)
     # create_vector_file(in_folder='/home/gabi/workspace/opencv-haar-classifier-training/positive_images/',
     #                    neg_file='/home/gabi/workspace/opencv-haar-classifier-training/negatives.txt',
     #                    output_vector_file='/home/gabi/workspace/opencv-haar-classifier-training/total_vector.vec',

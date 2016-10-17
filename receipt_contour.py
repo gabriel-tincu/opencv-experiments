@@ -8,6 +8,7 @@ from swt import SWTScrubber
 from tesserocr import RIL, PyTessBaseAPI
 import PIL
 
+
 class SwtPoint2D:
     def __init__(self, x, y, swt):
         self.x = x
@@ -15,22 +16,6 @@ class SwtPoint2D:
         self.swt = swt
 
 
-def tag_text(in_path, out_folder):
-    out_path = join(out_folder, basename(in_path))
-    out_image = cv2.imread(in_path)[:, :, 0]
-    thr = cv2.adaptiveThreshold(out_image, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 9, 4)
-    cv2.imwrite(out_path, thr)
-    image = PIL.Image.open(out_path)
-    out_image = cv2.imread(in_path)
-    with PyTessBaseAPI() as api:
-
-        api.SetImage(image)
-        boxes = api.GetComponentImages(RIL.SYMBOL, True)
-    boxes = [x[1] for x in boxes]
-    for b in boxes:
-        cv2.rectangle(out_image, (b['x'], b['y']), (b['x'] + b['w'], b['y']+b['h']), (255,), 3)
-    cv2.imwrite(out_path, out_image)
-    print('wrote {}'.format(in_path))
 
 
 def get_receipt_content(gray_image):
@@ -286,6 +271,4 @@ def write_all_from_folder(in_folder, out_folder):
     #     write_swt_image(f, out_folder)
 
 if __name__ == '__main__':
-    # res = SWTScrubber.scrub('/home/gabi/workspace/eloquentix/image-corpus/images/570a6493a310cb6bf27e019a_5f223673-7abd-42c7-8005-18e9a949b8b1.jpg')
-    write_all_from_folder(in_folder='/home/gabi/workspace/eloquentix/image-corpus/images',
-                          out_folder='/tmp/out')
+    pass
