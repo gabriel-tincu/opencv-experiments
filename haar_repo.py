@@ -18,14 +18,14 @@ from sklearn.linear_model import SGDClassifier
 from sklearn.utils.class_weight import compute_class_weight
 from math import ceil
 from sklearn.feature_extraction.image import extract_patches
-
-logging.basicConfig(level=logging.DEBUG,
+import time
+logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s %(message)s',
                     datefmt='%m/%d/%Y %I:%M:%S %p')
 
 
 def create_hog():
-    desc = cv2.HOGDescriptor((8, 8), (4, 4), (2, 2), (2, 2), 9)
+    desc = cv2.HOGDescriptor((20, 20), (10, 10), (5, 5), (5, 5), 9)
     def compute(arr):
         return desc.compute(arr)
     return compute
@@ -256,7 +256,7 @@ def evaluate_file_with_model(f, in_folder, out_folder, truth_folder, model_file)
     annot_file = join(truth_folder, f.split('.')[0] + '.json')
     if not os.path.isfile(annot_file):
         logging.info('Annotation file {} not found'.format(annot_file))
-    truth_boxes = [list(map(int, b['bounds'])) for b in json.load(open(annot_file)) if b['entity_type'] == 'TOTAL']
+    truth_boxes = [tuple(map(int, b['bounds'])) for b in json.load(open(annot_file)) if b['entity_type'] == 'TOTAL']
     boxes = model.detectMultiScale(image, scaleFactor=1.01, minSize=(3, 9), minNeighbors=3)
     if boxes is None or len(boxes) == 0:
         logging.warning('Unable to match any boxes on {}'.format(f))
@@ -369,6 +369,20 @@ def load_file_and_resize(in_path, w, h):
     return data
 
 
+def load_file_with_skews_and_resize(in_path, w, h, skews):
+    data = cv2.imread(in_path, cv2.IMREAD_GRAYSCALE)
+    if data is None:
+        raise Exception('Error reading {}'.format(in_path))
+    all_data = [rotate_about_center(data, s) for s in skews]
+    ret_val = []
+    for d in all_data:
+        if d.shape != (h, w):
+            ret_val.append(cv2.resize(d, (w, h)))
+        else:
+            ret_val.append(d)
+    return ret_val
+
+
 def load_training_data(positive_folder, negative_folder, width, height, save_path='train.pck'):
     if os.path.isfile(save_path):
         logging.info('Training data already present on disk')
@@ -388,7 +402,26 @@ def load_training_data(positive_folder, negative_folder, width, height, save_pat
     return all_x, all_y
 
 
-def batch_training_data(positive_folder, negative_folder, width, height, n_batches):
+def rotate_about_center(src, angle, scale=1.):
+    w = src.shape[1]
+    h = src.shape[0]
+    rangle = np.deg2rad(angle)  # angle in radians
+    # now calculate new image width and height
+    nw = (abs(np.sin(rangle)*h) + abs(np.cos(rangle)*w))*scale
+    nh = (abs(np.cos(rangle)*h) + abs(np.sin(rangle)*w))*scale
+    # ask OpenCV for the rotation matrix
+    rot_mat = cv2.getRotationMatrix2D((nw*0.5, nh*0.5), angle, scale)
+    # calculate the move from the old center to the new center combined
+    # with the rotation
+    rot_move = np.dot(rot_mat, np.array([(nw-w)*0.5, (nh-h)*0.5,0]))
+    # the move only affects the translation, so update the translation
+    # part of the transform
+    rot_mat[0,2] += rot_move[0]
+    rot_mat[1,2] += rot_move[1]
+    return cv2.warpAffine(src, rot_mat, (int(np.ceil(nw)), int(np.ceil(nh))), flags=cv2.INTER_LANCZOS4)
+
+
+def batch_training_data(positive_folder, negative_folder, width, height, n_batches, skew_range=range(-60, 60, 10)):
     positive_files = [join(positive_folder, x) for x in os.listdir(positive_folder) if x.endswith('jpg')]
     negative_files = [join(negative_folder, x) for x in os.listdir(negative_folder) if x.endswith('jpg')]
     np.random.shuffle(positive_files)
@@ -399,40 +432,45 @@ def batch_training_data(positive_folder, negative_folder, width, height, n_batch
     for i in range(n_batches):
         pos_x = positive_files[pos_batch_size*i:pos_batch_size*(i+1)]
         neg_x = negative_files[neg_batch_size*i:neg_batch_size*(i+1)]
+
+        pos_x = [x for y in map(partial(load_file_with_skews_and_resize, w=width, h=height, skews=skew_range), pos_x) for x in y]
         pos_y = [1 for _ in pos_x]
+
+        neg_x = list(map(partial(load_file_and_resize, w=width, h=height), neg_x))
         neg_y = [0 for _ in neg_x]
-        all_x = list(map(partial(load_file_and_resize, w=width, h=height), pos_x + neg_x))
-        all_y = pos_y+neg_y
+        all_x = pos_x + neg_x
+        all_y = pos_y + neg_y
         yield all_x, all_y
 
 
-def get_class_weight(positive_folder, negative_folder):
-    y = [1 for _ in os.listdir(positive_folder)] + [0 for _ in os.listdir(negative_folder)]
+def get_class_weight(positive_folder, negative_folder, skew_count):
+    y = [1 for _ in os.listdir(positive_folder) * skew_count] + [0 for _ in os.listdir(negative_folder)]
     weights = compute_class_weight('balanced', np.array([1, 0]), y)
     return {1: weights[0], 0: weights[1]}
 
 
-def prepare_model(positive_folder, negative_folder, w, h, svm_save_path='svm.pck'):
+def prepare_model(positive_folder, negative_folder, w, h, svm_save_path='svm.pck', skews=list(range(-90, 90, 5))):
     if os.path.isfile(svm_save_path):
         return pickle.load(open(svm_save_path, 'rb'))
     model = create_model()
     first_pass = True
-    model.class_weight = get_class_weight(positive_folder, negative_folder)
-    for all_x, all_y in batch_training_data(positive_folder=positive_folder,
-                                            negative_folder=negative_folder,
-                                            width=w,
-                                            height=h,
-                                            n_batches=50):
+    model.class_weight = get_class_weight(positive_folder, negative_folder, skew_count=len(skews))
+    for i, (all_x, all_y) in enumerate(batch_training_data(positive_folder=positive_folder,
+                                                           negative_folder=negative_folder,
+                                                           width=w,
+                                                           height=h,
+                                                           n_batches=50,
+                                                           skew_range=skews)):
         all_x = np.array([hog(x).flatten() for x in all_x]).astype(np.float32)
         all_y = np.array(all_y).astype(np.int32).ravel()
-        logging.info('Training model on {} samples'.format(len(all_y)))
+        logging.info('Training model on {} samples at batch {}'.format(len(all_y), i+1))
         if first_pass:
             model = model.partial_fit(all_x, all_y, classes=[1, 0])
             first_pass = False
         else:
             model = model.partial_fit(all_x, all_y)
-        pickle.dump(model, open(svm_save_path, 'wb'))
-        logging.info('Model saved on disk')
+    pickle.dump(model, open(svm_save_path, 'wb'))
+    logging.info('Model saved on disk')
     return model
 
 
@@ -507,13 +545,16 @@ def detect_multi_scale(image, svm, scale, win_size, win_stride, max_size=None, m
         min_h, min_w = min_size
 
     # first the normal image
-    results = detect_boxes(image, svm, win_size, win_stride)
 
     # TODO if we ditch the generator pattern and just man up and return a list from up/down scaling, we can then
     # TODO use multiprocessing to evaluate these in parallel.. maybe even merge the scale/evaluate steps into one
+    down = list(image_pyramid_down(image, scale, min_h, min_w))
+    up = list(image_pyramid_up(image, scale, max_h, max_w))
+    logging.debug('Detecting on {} scaled images'.format(len(up) + len(down) + 1))
 
+    results = detect_boxes(image, svm, win_size, win_stride)
     # then down scaled
-    for i in image_pyramid_down(image, scale, min_h, min_w):
+    for i in down:
         down_results = detect_boxes(i, svm, win_size, win_stride)
         if len(down_results) > 0:
             up_scale = image.shape[0] / i.shape[0]
@@ -521,7 +562,7 @@ def detect_multi_scale(image, svm, scale, win_size, win_stride, max_size=None, m
             results.extend(down_results)
 
     # then up scaled
-    for i in image_pyramid_up(image, scale, max_h, max_w):
+    for i in up:
         up_results = detect_boxes(i, svm, win_size, win_stride)
         if len(up_results) > 0:
             down_scale = image.shape[0] / i.shape[0]
@@ -532,6 +573,37 @@ def detect_multi_scale(image, svm, scale, win_size, win_stride, max_size=None, m
     return results
 
 
+def evaluate_and_return_results(in_path,
+                                model,
+                                win_size,
+                                win_stride,
+                                scale,
+                                truth_folder):
+    then = time.time()
+    annot_file = join(truth_folder, basename(in_path).split('.')[0] + '.json')
+    truth_boxes = [tuple(map(int, b['bounds'])) for b in json.load(open(annot_file)) if b['entity_type'] == 'TOTAL']
+    image = cv2.imread(in_path, cv2.IMREAD_GRAYSCALE)
+    results = detect_multi_scale(image=image,
+                                 svm=model,
+                                 scale=scale,
+                                 win_size=win_size,
+                                 win_stride=win_stride)
+    # apply non maxima suppression
+    results = [(x1, y1, x2, y2) for (y1, x1), (y2, x2) in results]
+    results = [tuple(x) for x in non_max_supression_slow(results, 0.8)]
+    tp = 0
+
+    matched = set()
+    for t in truth_boxes:
+        true = [x for x in results if intersection_over_union(t, x) >= 0.5]
+        if len(true) > 0:
+            # increase tp
+            tp += 1
+        for tr in true:
+            matched.add(tr)
+    return tp, len(truth_boxes), len(results), time.time() - then
+
+
 def evaluate_and_copy_negatives(in_path,
                                 svm,
                                 win_size,
@@ -539,21 +611,24 @@ def evaluate_and_copy_negatives(in_path,
                                 scale,
                                 truth_folder,
                                 negative_folder):
-    truth_boxes = get_symbol_boxes(in_path, truth_folder)
+    truth_boxes = get_price_boxes(in_path, truth_folder)
     if truth_boxes is None:
         logging.error('No annotation file present for {}...skipping analisys'.format(in_path))
     image = cv2.imread(in_path, cv2.IMREAD_GRAYSCALE)
+    then = time.time()
     results = detect_multi_scale(image=image,
                                  svm=svm,
                                  scale=scale,
                                  win_size=win_size,
                                  win_stride=win_stride)
+    elapsed = time.time() - then
+    print('Detection took {} seconds'.format(elapsed))
     if len(results) > 0:
         logging.info('Found {} results for file {}'.format(len(results), in_path))
         new_boxes = [(x1, y1, x2, y2) for ((y1, x1), (y2, x2)) in results]
         true_results = set()
         for tb in truth_boxes:
-            t = [b for b in new_boxes if intersection_over_union(b, tb) > 0.6]
+            t = [b for b in new_boxes if intersection_over_union(b, tb) > 0.2]
             for tr in t:
                 true_results.add(tr)
         false_results = [x for x in new_boxes if x not in true_results and box_area(*x) > 0]
@@ -640,22 +715,29 @@ def evaluate_folder(positive_folder,
     model = prepare_model(positive_folder=positive_folder, negative_folder=negative_folder, w=w, h=h)
     pool = Pool(cpu_count())
     files = [join(image_folder, x) for x in os.listdir(image_folder) if x.endswith('jpg')]
-    pool.map(partial(evaluate_and_copy_negatives,
-                     svm=model,
-                     win_size=(h,w),
-                     win_stride=stride,
-                     scale=scale,
-                     truth_folder='/home/gabi/workspace/eloquentix/image-corpus/tesseract',
-                     negative_folder=negative_folder), files)
+    results = pool.map(partial(evaluate_and_return_results,
+                               model=model,
+                               win_size=(h,w),
+                               win_stride=stride,
+                               scale=scale,
+                               truth_folder='/home/gabi/workspace/eloquentix/benchmark/annotations'), files)
+    tp, ap, ar, at = tuple(zip(*results))
+    tp, ap = sum(tp), sum(ap)
+    fn = ap - tp
+    recall = tp / (tp + fn)
+    avg_time = np.mean(at)
+    print('Recall score: {}, Avg time: {}, Max time: {}, Min time: {}'.format(recall, avg_time, max(at), min(at)))
+    pickle.dump(results, open('/tmp/results.pck'))
 
 def eval_one():
     model = prepare_model(None, None, 0, 0)
-    evaluate_and_write_results(in_path='/home/gabi/workspace/eloquentix/image-corpus/images/5728a478a3103667aa3c1a6d_e0367cbd-0864-4e76-bc32-4749de87f8f5.jpg',
-                               svm=model,
-                               win_size=(20, 60),
-                               win_stride=(3, 3),
-                               scale=1.05,
-                               out_folder='/tmp/out')
+    r = evaluate_and_return_results(in_path='/home/gabi/workspace/eloquentix/benchmark/images/57195cfea3103e0c1852259b_848dd4e9-fbb1-482c-aea8-e7dd2f4d53f6.jpg',
+                                model=model,
+                                win_size=(20, 80),
+                                win_stride=(3, 3),
+                                scale=1.05,
+                                truth_folder='/home/gabi/workspace/eloquentix/benchmark/annotations')
+    print(r)
 
 def write_all_file_corners():
     image_folder = '/home/gabi/workspace/eloquentix/image-corpus/images'
@@ -663,15 +745,15 @@ def write_all_file_corners():
     for f in os.listdir(image_folder):
         write_corners(join(image_folder, f), out_folder)
 
+
 def evaluate_full():
-    truth_folder = '/home/gabi/workspace/eloquentix/image-corpus/tesseract'
-    positive_folder = '/home/gabi/workspace/opencv-haar-classifier-training/positive_symbols/'
-    negative_folder = '/home/gabi/workspace/opencv-haar-classifier-training/negative_symbols'
-    image_folder = '/home/gabi/workspace/eloquentix/image-corpus/images'
-    w = 8
-    h = 16
-    evaluate_folder(positive_folder=positive_folder,
-                    negative_folder=negative_folder,
+    # positive_folder = '/home/gabi/workspace/opencv-haar-classifier-training/positive_crops/'
+    # negative_folder = '/home/gabi/workspace/opencv-haar-classifier-training/negative_crops'
+    image_folder = '/home/gabi/workspace/eloquentix/benchmark/images'
+    w = 80
+    h = 20
+    evaluate_folder(positive_folder=None,
+                    negative_folder=None,
                     w=w,
                     h=h,
                     image_folder=image_folder)
@@ -706,6 +788,7 @@ if __name__ == '__main__':
     # create_symbol_corpus('/home/gabi/workspace/eloquentix/image-corpus/images',
     #                      '/home/gabi/workspace/eloquentix/image-corpus/tesseract')
     evaluate_full()
+    # evaluate_full()
     # write_all_crops(out_folder='/home/gabi/workspace/opencv-haar-classifier-training/negative_symbols',
     #                 in_folder='/home/gabi/workspace/opencv-haar-classifier-training/negative_images/',
     #                 crop_h=16, crop_w=8, file_limit=None)
